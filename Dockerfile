@@ -1,72 +1,112 @@
-FROM php:8.4-fpm
+# =========================================================
+# Stage 1: Frontend build with Bun
+# =========================================================
+FROM oven/bun:1-alpine AS frontend
 
-# Cài đặt dependencies
-RUN apt-get update && apt-get install -y \
+WORKDIR /app
+
+COPY package.json bun.lock* ./
+RUN if [ -f bun.lock ]; then bun install --frozen-lockfile; else bun install; fi
+
+COPY . .
+RUN bun run build
+
+
+# =========================================================
+# Stage 2: PHP vendor
+# =========================================================
+FROM composer:2 AS vendor
+
+WORKDIR /app
+
+COPY composer.json composer.lock ./
+RUN composer install \
+    --no-dev \
+    --no-interaction \
+    --no-progress \
+    --prefer-dist \
+    --optimize-autoloader
+
+COPY . .
+RUN composer dump-autoload --optimize --no-dev
+
+
+# =========================================================
+# Stage 3: Production runtime
+# =========================================================
+FROM php:8.4-fpm-alpine
+
+WORKDIR /var/www/html
+
+RUN apk add --no-cache \
     nginx \
     supervisor \
-    libpng-dev \
-    libjpeg-dev \
-    zip \
-    unzip \
-    libfreetype6-dev \
-    libpq-dev \
-    libonig-dev \
-    libssl-dev \
-    libxml2-dev \
-    libcurl4-openssl-dev \
-    libicu-dev \
-    libzip-dev \
-    libmagickwand-dev \
+    bash \
     curl \
-    jq \
     git \
+    unzip \
+    zip \
+    icu-dev \
+    oniguruma-dev \
+    libzip-dev \
+    postgresql-dev \
+    libpng-dev \
+    libjpeg-turbo-dev \
+    freetype-dev \
     libwebp-dev \
+    imagemagick \
+    imagemagick-dev \
+    linux-headers \
+    shadow \
+    fcgi \
     && docker-php-ext-configure gd --with-freetype --with-jpeg --with-webp \
-    && docker-php-ext-install gd pdo pdo_mysql pdo_pgsql pgsql opcache intl bcmath pcntl zip exif \
-    && pecl install redis \
-    && pecl install imagick \
+    && docker-php-ext-install -j$(nproc) \
+        bcmath \
+        exif \
+        gd \
+        intl \
+        opcache \
+        pcntl \
+        pdo \
+        pdo_mysql \
+        pdo_pgsql \
+        pgsql \
+        zip \
+    && pecl install redis imagick \
     && docker-php-ext-enable redis imagick \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /tmp/pear /var/cache/apk/*
 
-# Cài Bun
-RUN curl -fsSL https://bun.sh/install | bash \
-    && mv /root/.bun/bin/bun /usr/local/bin/bun
+RUN { \
+    echo "memory_limit=512M"; \
+    echo "upload_max_filesize=64M"; \
+    echo "post_max_size=64M"; \
+    echo "max_execution_time=120"; \
+    echo "max_input_vars=3000"; \
+    echo "expose_php=0"; \
+    echo "opcache.enable=1"; \
+    echo "opcache.enable_cli=1"; \
+    echo "opcache.memory_consumption=256"; \
+    echo "opcache.interned_strings_buffer=16"; \
+    echo "opcache.max_accelerated_files=20000"; \
+    echo "opcache.validate_timestamps=0"; \
+    echo "realpath_cache_size=4096K"; \
+    echo "realpath_cache_ttl=600"; \
+} > /usr/local/etc/php/conf.d/99-app.ini
 
-# Copy Composer
-COPY --from=composer:latest /usr/bin/composer /usr/bin/composer
+COPY . /var/www/html
+COPY --from=vendor /app/vendor /var/www/html/vendor
+COPY --from=frontend /app/public/build /var/www/html/public/build
 
-# Tạo thư mục ứng dụng
-WORKDIR /var/www
+COPY .docker/nginx.conf /etc/nginx/http.d/default.conf
+COPY .docker/supervisord.conf /etc/supervisord.conf
+COPY .docker/php-fpm-www.conf /usr/local/etc/php-fpm.d/www.conf
+COPY .docker/entrypoint.sh /entrypoint.sh
 
-# Copy mã nguồn Laravel
-COPY . /var/www
-
-# Cài đặt Composer dependencies (keep composer.lock for consistency)
-RUN composer install --prefer-dist --no-dev --optimize-autoloader --no-interaction \
-    && php artisan storage:link || true \
-    && php artisan config:clear || true \
-    && php artisan cache:clear || true
-
-RUN chown -R www-data:www-data /var/www \
-    && chmod -R 775 /var/www/storage /var/www/bootstrap/cache
-
-# Cài đặt dependencies và build frontend với Bun
-RUN bun install && bun run build
-
-# Copy cấu hình Nginx
-COPY docker/nginx.conf /etc/nginx/nginx.conf
-COPY docker/default.conf /etc/nginx/sites-enabled/default
-
-# Cấu hình PHP-FPM
-COPY docker/php-fpm.conf /usr/local/etc/php-fpm.d/zz-laravel.conf
-
-# Copy php.ini cấu hình upload
-COPY docker/php.ini /usr/local/etc/php/conf.d/uploads.ini
-
-# Copy cấu hình supervisord để chạy cả nginx và php-fpm
-COPY docker/supervisord.conf /etc/supervisord.conf
+RUN chmod +x /entrypoint.sh \
+    && mkdir -p /run/nginx /var/log/supervisor /var/lib/nginx/tmp/client_body /var/www/html/storage/logs \
+    && chown -R www-data:www-data /var/www/html \
+    && chmod -R 775 /var/www/html/storage /var/www/html/bootstrap/cache
 
 EXPOSE 8080
 
-CMD ["/usr/bin/supervisord", "-c", "/etc/supervisord.conf"]
+ENTRYPOINT ["/entrypoint.sh"]
