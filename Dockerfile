@@ -1,21 +1,54 @@
 # =========================================================
-# Stage 1: Frontend build with Bun
+# Stage 1: PHP base with required extensions
 # =========================================================
-FROM oven/bun:1-alpine AS frontend
+FROM php:8.4-fpm-alpine AS php_base
 
 WORKDIR /app
 
-COPY package.json bun.lock* ./
-RUN if [ -f bun.lock ]; then bun install --frozen-lockfile; else bun install; fi
+RUN apk add --no-cache \
+    bash \
+    curl \
+    git \
+    unzip \
+    zip \
+    icu-dev \
+    oniguruma-dev \
+    libzip-dev \
+    postgresql-dev \
+    libpng-dev \
+    libjpeg-turbo-dev \
+    freetype-dev \
+    libwebp-dev \
+    imagemagick \
+    imagemagick-dev \
+    linux-headers \
+    fcgi \
+    shadow \
+    $PHPIZE_DEPS \
+    && docker-php-ext-configure gd --with-freetype --with-jpeg --with-webp \
+    && docker-php-ext-install -j$(nproc) \
+        bcmath \
+        exif \
+        gd \
+        intl \
+        opcache \
+        pcntl \
+        pdo \
+        pdo_mysql \
+        pdo_pgsql \
+        pgsql \
+        zip \
+    && pecl install redis imagick \
+    && docker-php-ext-enable redis imagick \
+    && rm -rf /tmp/pear /var/cache/apk/*
 
-COPY . .
-RUN bun run build
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 
 
 # =========================================================
-# Stage 2: PHP vendor
+# Stage 2: Install PHP vendors in correct PHP environment
 # =========================================================
-FROM composer:2 AS vendor
+FROM php_base AS vendor
 
 WORKDIR /app
 
@@ -25,14 +58,32 @@ RUN composer install \
     --no-interaction \
     --no-progress \
     --prefer-dist \
-    --optimize-autoloader
+    --no-scripts
 
 COPY . .
+
 RUN composer dump-autoload --optimize --no-dev
+RUN php artisan package:discover --ansi || true
 
 
 # =========================================================
-# Stage 3: Production runtime
+# Stage 3: Build frontend with Bun, after vendor is ready
+# =========================================================
+FROM oven/bun:1-alpine AS frontend
+
+WORKDIR /app
+
+COPY package.json bun.lock* ./
+RUN if [ -f bun.lock ]; then bun install --frozen-lockfile; else bun install; fi
+
+COPY . .
+COPY --from=vendor /app/vendor /app/vendor
+
+RUN bun run build
+
+
+# =========================================================
+# Stage 4: Production runtime
 # =========================================================
 FROM php:8.4-fpm-alpine
 
@@ -57,8 +108,8 @@ RUN apk add --no-cache \
     imagemagick \
     imagemagick-dev \
     linux-headers \
-    shadow \
     fcgi \
+    shadow \
     && docker-php-ext-configure gd --with-freetype --with-jpeg --with-webp \
     && docker-php-ext-install -j$(nproc) \
         bcmath \
@@ -103,7 +154,15 @@ COPY .docker/php-fpm-www.conf /usr/local/etc/php-fpm.d/www.conf
 COPY .docker/entrypoint.sh /entrypoint.sh
 
 RUN chmod +x /entrypoint.sh \
-    && mkdir -p /run/nginx /var/log/supervisor /var/lib/nginx/tmp/client_body /var/www/html/storage/logs \
+    && mkdir -p \
+        /run/nginx \
+        /var/log/supervisor \
+        /var/lib/nginx/tmp/client_body \
+        /var/www/html/storage/logs \
+        /var/www/html/storage/framework/cache \
+        /var/www/html/storage/framework/sessions \
+        /var/www/html/storage/framework/views \
+        /var/www/html/bootstrap/cache \
     && chown -R www-data:www-data /var/www/html \
     && chmod -R 775 /var/www/html/storage /var/www/html/bootstrap/cache
 
